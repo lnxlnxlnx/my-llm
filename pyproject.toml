@@ -10,3 +10,15 @@ dependencies = [
     "torch>=2.9.0",
     "transformers>=4.57.1",
 ]
+
+[tool.ruff]
+target-version = "py312"
+preview = true
+select = [
+    "E",
+    "F",
+    "W",
+    "C90",
+    "B",
+    "Q000",
+]

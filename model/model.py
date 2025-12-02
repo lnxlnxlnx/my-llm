@@ -1,4 +1,8 @@
+import math
 from transformers import PretrainedConfig
+import torch
+import torch.nn as nn
+from typing import Optional
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -11,7 +15,7 @@ class MokioMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512,
-        intermediate_size: int = None,
+        intermediate_size: Optional[int] = None,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -21,16 +25,15 @@ class MokioMindConfig(PretrainedConfig):
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
-        
         ############ MoE ############
-        use_moe:bool=False,
-        num_experts_per_tok:int=2,
-        n_routed_experts:int=4,
-        n_shared_experts:int=1,
-        scoring_func:str='softmax',
-        aux_loss_alpha:float=0.1,
-        seq_aux:bool=True,
-        norm_topk_prob:bool=True,
+        use_moe: bool = False,
+        num_experts_per_tok: int = 2,
+        n_routed_experts: int = 4,
+        n_shared_experts: int = 1,
+        scoring_func: str = "softmax",
+        aux_loss_alpha: float = 0.1,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,14 +53,14 @@ class MokioMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
-        self.use_moe=use_moe
-        self.num_experts_per_tok=num_experts_per_tok
-        self.n_routed_experts=n_routed_experts
-        self.n_shared_experts=n_shared_experts
-        self.seq_aux=seq_aux
-        self.norm_topk_prob=norm_topk_prob
-        self.aux_loss_alpha=aux_loss_alpha
-        self.scoring_func=scoring_func
+        self.use_moe = use_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.seq_aux = seq_aux
+        self.norm_topk_prob = norm_topk_prob
+        self.aux_loss_alpha = aux_loss_alpha
+        self.scoring_func = scoring_func
 
         self.rope_scaling = (
             {
@@ -71,3 +74,82 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return x * self.weight * self._norm(x).float().type_as(x)
+
+
+def precompute_freqs_cis(
+    dim: int,
+    end: int = (32 * 1024),
+    rope_base: float = 1e6,
+    rope_scaling: Optional[dict] = None,
+):
+    # 写出最初的RoPE式子
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    # 根据公式计算
+    if rope_scaling is not None:
+        orig_max = rope_scaling.get("original_max_position_embeddings", 2048)
+        factor = rope_scaling.get("factor", 4)
+        beta_fast = rope_scaling.get("beta_fast", 4)
+        beta_slow = rope_scaling.get("beta_slow", 1)
+        # else:
+        #     orig_max = 2048
+        #     factor = 4
+        #     beta_fast = 4
+        #     beta_slow = 1
+
+        # 计算corr_dim
+        corr_dim = next(
+            (i for i in range(1, dim // 2) if 2 * math.pi / freqs[i] >= orig_max),
+            dim // 2,
+        )
+
+        # 计算power
+        power = torch.arange(0, dim // 2, device=freqs.device).float() / (
+            max(dim // 2 - 1, 1)
+        )
+
+        # 计算beta
+        beta = beta_fast + power * (beta_slow - beta_fast)
+
+        # 计算scale
+        scale = torch.where(
+            torch.arange(dim // 2, device=freqs.device) < corr_dim,
+            (beta * factor - beta + 1) / (beta * factor),
+            1.0 / factor,
+        )
+
+        # 计算缩放后的freqs
+        freqs = freqs * scale
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    def rotate_half(x):
+        """Rotate half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embedded = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embedded = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    return q_embedded, k_embedded
