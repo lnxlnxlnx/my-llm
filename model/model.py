@@ -2,7 +2,11 @@ import math
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple
+from rich.traceback import install
+import torch.nn.functional as F
+
+install()
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -25,7 +29,7 @@ class MokioMindConfig(PretrainedConfig):
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
-        ############ MoE ############
+        # MoE ############
         use_moe: bool = False,
         num_experts_per_tok: int = 2,
         n_routed_experts: int = 4,
@@ -153,3 +157,149 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
         rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embedded, k_embedded
+
+
+def repeat_kv(x, n_rep: int):
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
+    if n_rep == 1:
+        return x
+    bs, slen, key_value_heads, dim = x.shape
+    x = x[:, :, :, None, :].expand(bs, slen, key_value_heads, n_rep, dim)
+    x = x.reshape(bs, slen, key_value_heads * n_rep, dim)
+    return x
+
+
+"""
+假设输入 x.shape = (2, 10, 4, 64)（bs=2，slen=10，key_value_heads=4，dim=64），n_rep=2：
+插入新维度后：(2, 10, 4, 1, 64)；
+expand 后：(2, 10, 4, 2, 64)（每个键值头复制 2 份）；
+reshape 后：(2, 10, 8, 64)（4*2=8 个扩展后的键值头）。
+"""
+
+"""
+        假设外部参数为：
+        args.num_attention_heads = 16（16 个 Q 头）
+        self.num_key_value_heads = 8（8 个 KV 头）
+        args.hidden_size = 1024（总隐藏层维度）
+        则计算结果：
+        n_local_heads = 16
+        n_local_kv_heads = 8
+        n_rep = 16 // 8 = 2（每个 KV 头对应 2 个 Q 头）
+        head_dim = 1024 // 16 = 64（每个 Q/KV 头的维度都是 64）
+        最终：16 个 Q 头（每个 64 维）、8 个 KV 头（每个 64 维，复用 2 次），
+        总维度均为 16×64=1024，与隐藏层维度一致。
+
+"""
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        # TODO: what is this?隐藏层
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        # TODO: what is this?flash and dropout
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        bsz, seq_len, _ = x.shape
+
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+
+        past_kv = (xk, xv) if use_cache else None
+
+        xq = xq.transpose(1, 2)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+
+        if (
+            self.flash
+            and seq_len > 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1)
+                .expand(bsz, self.n_local_heads, seq_len, -1)
+                .bool()
+            )
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,  # 自回归（因果）注意力
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=-1,
+            )
+
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
