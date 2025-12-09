@@ -24,9 +24,13 @@ def connect_k230_server():
         print(f"🌟 已发送数据: {send_data.decode()}")
 
         # 4. 接收K230的响应
-        recv_data = client_socket.recv(1024)
-        if recv_data:
-            print(f"🌟 收到K230响应: {recv_data.decode().strip()}")
+        while True:
+            time.sleep(1)
+            recv_data = client_socket.recv(1024)
+            if recv_data:
+                print(f"🌟 收到K230响应: {recv_data.decode().strip()}")
+                #print(f"🌟 收到K230响应: {recv_data.decode()}")
+                #print(f"🌟 收到K230响应: {recv_data}")
 
     except socket.timeout:
         print("❌ 连接超时！请检查K230服务端是否启动或IP/端口是否正确")

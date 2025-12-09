@@ -1,10 +1,15 @@
-import math
 from transformers import PretrainedConfig
 import torch
+import math
 import torch.nn as nn
-from typing import Optional, Tuple
-from rich.traceback import install
+from typing import Optional, Tuple, List, Union  # noqa: F401
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
+import torch.nn.init as init
+from transformers import PreTrainedModel, GenerationMixin  # noqa: F401
+from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: F401
+from rich.traceback import install
+
 
 install()
 
@@ -92,7 +97,7 @@ class RMSNorm(nn.Module):
         return x * self.weight * self._norm(x).float().type_as(x)
 
 
-def precompute_freqs_cis(
+def precompute_freqs(
     dim: int,
     end: int = (32 * 1024),
     rope_base: float = 1e6,
@@ -303,3 +308,360 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
+
+
+class FeedForward(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.config.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+        self.n_routed_experts = self.config.n_routed_experts
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                )
+                ce = ce.div(seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        return topk_weight, topk_idx, aux_loss
+
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        # 专家层
+        self.experts = nn.ModuleList([
+            FeedForward(config) for _ in range(config.n_routed_experts)
+        ])  # 所有专家是独立初始化
+
+
+class MoEFeedForaward(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        # 专家层
+        self.experts = nn.ModuleList([
+            FeedForward(config) for _ in range(config.n_routed_experts)
+        ])
+        # 门控层
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                FeedForward(config) for _ in range(config.n_shared_experts)
+            ])
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        # 使用门控机制旋转专家
+        topk_weight, topk_idx, aux_loss = self.gate(x)
+        # 展开x以便处理
+        x = x.view(-1, x.shape[-1])
+
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            # 按照定义的num_experts_per_tok重复输入token
+            # 每个token安排num_experts_per_tok个专家处理
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # y是空张量，和x形状相同
+            y = torch.empty_like(x, dtype=torch.float32)
+            # 遍历所有专家
+            for i, expert in enumerate(self.experts):
+                # 找到所有指向专家i的token
+                # 然后将这些token输入专家i进行处理
+                # 最后将结果放回y对应位置
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
+            # 加权求和
+            # 最后的y意义是每个token经过专家处理后的加权结果
+            y = y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1).sum(dim=1)
+            y = y.view(*orig_shape)
+        # 如果是推理阶段
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    # MoE推理方法
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.experts[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
+
+
+class MokioMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attention = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = (
+            FeedForward(config) if not config.use_moe else MoEFeedForaward(config)
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        res = hidden_states
+
+        hidden_states, present_key_value = self.self_attention(
+            self.input_layernorm(hidden_states),  # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        hidden_states = res + hidden_states
+
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_value
+
+
+class MokioMindModel(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([
+            MokioMindBlock(l, config) for l in range(self.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # input_ids: [bsz, seq_len]
+        if input_ids is None:
+            raise ValueError("input_ids cannot be None")
+        batch_size, seq_length = input_ids.shape
+
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None            
+
+        past_key_values = past_key_values or [(None, None)] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        # Embedding + dropout
+        hidden_states = self.dropout(
+            self.embed_tokens(input_ids)
+        )  # [bsz, seq_len, hidden]
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
+        )
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MoEFeedForaward)
+        )
+
+        return hidden_states, presents, aux_loss
+
+
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MokioMindConfig
+
+    def __init__(self, config: MokioMindConfig):
+        super().__init__(config)
+        self.model = MokioMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        h, past_kvs, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(h[:, slice_indices, :])
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_kvs,
+            hidden_states=h,
+        )
