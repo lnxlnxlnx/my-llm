@@ -1,0 +1,209 @@
+{
+    "task_type": "ocr_detection",
+    "project_dir": "C:\\Users\\lnx\\Desktop\\DeepLearning_task\\ocr检测",
+    "project_name": "ocr检测",
+    "project_state": "",
+    "project_create_time": "2025-12-03",
+    "project_update_time": "2025-12-03",
+    "model_type": "OCR_DNet",
+    "model_parameter": {
+        "backbone": "can2",
+        "backbone_mode": "small",
+        "pretrained": true,
+        "width_mult": 0.5
+    },
+    "split_percent": [
+        80,
+        10,
+        10
+    ],
+    "pre_train_path": "pretrain_weights",
+    "labels": [
+        "ocr"
+    ],
+    "mean": [
+        0.485,
+        0.456,
+        0.406
+    ],
+    "std": [
+        0.229,
+        0.224,
+        0.225
+    ],
+    "auto_enhance": false,
+    "data_augment": {
+        "BrightnessJitter": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "brightness": 0.1
+            }
+        },
+        "ContrastJitter": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "contrast": 0.2
+            }
+        },
+        "SaturationJitter": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "saturation": 0.3
+            }
+        },
+        "HueJitter": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "hue": 0
+            }
+        },
+        "RandomSharpness": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "sharpness_factor": 0
+            }
+        },
+        "RandomHorizontalFlip": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "p": 0.5
+            }
+        },
+        "RandomVerticalFlip": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "p": 0.5
+            }
+        },
+        "RandomScale": {
+            "apply": false,
+            "parameter": {
+                "scales": [
+                    0.5,
+                    0.75,
+                    1.0,
+                    1.25,
+                    1.5,
+                    1.75,
+                    2.0
+                ]
+            }
+        },
+        "RandomCrop": {
+            "apply": false,
+            "parameter": {
+                "size": [
+                    512,
+                    512
+                ]
+            }
+        },
+        "RandomPerspective": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "distortion_scale": 0
+            }
+        },
+        "GaussianBlur": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "sigma": 0
+            }
+        },
+        "RandomErasing": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "scale": [
+                    0.02,
+                    0.33
+                ],
+                "ratio": [
+                    0.3,
+                    3.3
+                ]
+            }
+        },
+        "CutOut": {
+            "apply": false,
+            "parameter": {
+                "rand": true,
+                "scale": [
+                    0.02,
+                    0.4
+                ]
+            }
+        },
+        "GridMask": {
+            "apply": false,
+            "parameter": {
+                "rand": false,
+                "d1": 10,
+                "d2": 20
+            }
+        },
+        "FenceMask": {
+            "apply": false,
+            "parameter": {
+                "rand": false,
+                "d1": 10,
+                "d2": 20
+            }
+        }
+    },
+    "dataset_dir": "E:\\百度网盘资源\\学习资料\\RCTW\\train_ocr",
+    "train_dataset": {
+        "datasetPath": "train_list.txt"
+    },
+    "val_dataset": {
+        "datasetPath": "val_list.txt"
+    },
+    "test_dataset": {
+        "datasetPath": "test_list.txt"
+    },
+    "train_dataloader": {
+        "batch_size": 4
+    },
+    "val_dataloader": {
+        "batch_size": 1
+    },
+    "test_dataloader": {
+        "batch_size": 1
+    },
+    "loss": "DBloss",
+    "loss_parameter": {},
+    "optimizer": "Adam",
+    "optimizer_parameter": {
+        "lr": 0.0005
+    },
+    "lrscheduler": "WarmupPolyLR",
+    "lrscheduler_parameter": {
+        "warmup_epoch": 3
+    },
+    "thresh": 0.3,
+    "box_thresh": 0.5,
+    "num_epochs": 100,
+    "gpu_index": 0,
+    "tricks": {},
+    "train_plot_interval": 5,
+    "img_size": 640,
+    "update": false,
+    "test_no_label_path": "",
+    "update_model_name": "",
+    "test_model_name": "best_OCR_DNet_can2_5.0s_20251203190318.npy",
+    "export_kmodel_name": "best_OCR_DNet_can2_5.0s_20251203190318.npy",
+    "other_test_dataset_dir": "",
+    "other_test_txt": "other_test.txt",
+    "deploy_history": false,
+    "last_deploy_time": "2025-12-03 21:22:20",
+    "last_deploy_model": "best_OCR_DNet_can2_5.0s_20251203190318.npy"
+}

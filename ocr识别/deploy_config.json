@@ -1,0 +1,8 @@
+{
+    "nncase_version": "2.9.0",
+    "chip_type": "k230",
+    "inference_width": 240,
+    "inference_height": 32,
+    "calibrate_method": "NoClip",
+    "ptq_option": "w:uint8 d:uint8"
+}
