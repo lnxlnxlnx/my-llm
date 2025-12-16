@@ -1,9 +1,11 @@
 import argparse
 import warnings
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+
 from model.model_lora import *
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
@@ -50,8 +52,8 @@ def main():
     parser.add_argument("--save_dir", default="out", type=str, help="模型权重目录")
     parser.add_argument(
         "--weight",
-        #default="full_sft",
-        default="m_pretrain",
+        default="full_sft",
+        # default="m_pretrain",
         type=str,
         help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
     )

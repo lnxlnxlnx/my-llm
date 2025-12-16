@@ -1,9 +1,11 @@
 import argparse
 import warnings
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+
 from model.model_lora import *
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
@@ -22,25 +24,18 @@ def init_model(args):
         )
         moe_suffix = "_moe" if args.use_moe else ""
         ckp = f"./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth"
-
-        # 关键修改：加载权重并替换参数名称
-        state_dict = torch.load(ckp, map_location=args.device)
-        # 处理可能的嵌套（如果权重是用 torch.save(model.state_dict()) 直接保存的，可跳过这步）
-        if "state_dict" in state_dict:  # 若权重文件是嵌套结构（如包含 epoch 等信息）
-            state_dict = state_dict["state_dict"]
-
-        # 批量替换：将 self_attention 改为 self_attn（匹配模型定义）
+        # model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        checkpoint = torch.load(ckp, map_location=args.device)
+        # 创建新的state_dict，替换key中的 self_attention 为 self_attn
         new_state_dict = {}
-        for key, value in state_dict.items():
+        for key, value in checkpoint.items():
             if "self_attention" in key:
                 new_key = key.replace("self_attention", "self_attn")
                 new_state_dict[new_key] = value
             else:
                 new_state_dict[key] = value
-
-        # 加载修改后的 state_dict
+        # 加载修改后的state_dict
         model.load_state_dict(new_state_dict, strict=True)
-
         if args.lora_weight != "None":
             apply_lora(model)
             load_lora(
