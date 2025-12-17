@@ -1,7 +1,3 @@
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Config
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-
 from transformers import PretrainedConfig
 
 
@@ -13,7 +9,7 @@ class MiniMindConfig(PretrainedConfig):
             dropout: float = 0.0,
             bos_token_id: int = 1,
             eos_token_id: int = 2,
-            hidden_act: str = 'silu',
+            hidden_act: str = "silu",
             hidden_size: int = 512,
             intermediate_size: int = None,
             max_position_embeddings: int = 32768,
@@ -33,7 +29,7 @@ class MiniMindConfig(PretrainedConfig):
             num_experts_per_tok: int = 2,
             n_routed_experts: int = 4,
             n_shared_experts: int = 1,
-            scoring_func: str = 'softmax',
+            scoring_func: str = "softmax",
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
@@ -78,18 +74,15 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
 
 
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Model
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-
 import math
+from typing import List, Optional, Tuple, Union
+
 import torch
-import torch.nn.init as init
 import torch.nn.functional as F
+import torch.nn.init as init
 from torch import nn
+from transformers import GenerationMixin, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
-from typing import Optional, Tuple, List, Union
-from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -163,7 +156,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -255,10 +248,10 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
-        if self.scoring_func == 'softmax':
+        if self.scoring_func == "softmax":
             scores = logits.softmax(dim=-1)
         else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+            raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
 
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
@@ -397,7 +390,7 @@ class MiniMindModel(nn.Module):
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+        if hasattr(past_key_values, "layers"): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 

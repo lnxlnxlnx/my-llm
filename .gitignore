@@ -1,2 +1,3 @@
 dataset/train_ocr/*
 ocr识别dataset/
+out/

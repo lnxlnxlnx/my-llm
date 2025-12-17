@@ -1,19 +1,24 @@
-from transformers import PretrainedConfig
-import torch
 import math
-import torch.nn as nn
-from typing import Optional, Tuple, List, Union  # noqa: F401
-import torch.nn.functional as F
-from transformers.activations import ACT2FN
-import torch.nn.init as init
-from transformers import PreTrainedModel, GenerationMixin  # noqa: F401
-from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: F401
-from rich.traceback import install
+from typing import List, Optional, Tuple, Union  # noqa: F401
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+from rich.traceback import install
+from transformers import (  # noqa: F401
+    GenerationMixin,
+    PretrainedConfig,
+    PreTrainedModel,
+)
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: F401
 
 install()
 
 
+# 配置：MokioMindConfig（相当于“模型的说明书”）
+# 用于存放所有超参数，就是一个配置文件可以类比游戏中角色属性的设定
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
@@ -84,6 +89,7 @@ class MokioMindConfig(PretrainedConfig):
         )
 
 
+# 功能类似 LayerNorm，但计算方式稍不同（基于均方根, RMS），用来稳定训练。
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -97,6 +103,8 @@ class RMSNorm(nn.Module):
         return x * self.weight * self._norm(x).float().type_as(x)
 
 
+# 目的是给注意力里的 Query 和 Key 加上“位置信息”，让模型分辨“前后顺序”。
+# 这里用的方式是 RoPE（rotary positional embeddings）。
 def precompute_freqs(
     dim: int,
     end: int = (32 * 1024),
@@ -164,6 +172,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embedded, k_embedded
 
 
+# 用来把少量的 key/value 头（KV）复用到更多的 query 头（Q）
 def repeat_kv(x, n_rep: int):
     """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
     if n_rep == 1:
@@ -287,6 +296,7 @@ class Attention(nn.Module):
                 is_causal=True,  # 自回归（因果）注意力
             )
         else:
+
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
             causal_mask = torch.triu(
@@ -585,14 +595,20 @@ class MokioMindModel(nn.Module):
         batch_size, seq_length = input_ids.shape
 
         if hasattr(past_key_values, "layers"):
-            past_key_values = None            
+            past_key_values = None
 
         past_key_values = past_key_values or [(None, None)] * len(self.layers)
 
         # 计算start_pos：如果存在past，则start_pos为已有past序列长度
-        start_pos = (
-            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        )
+        if (
+            past_key_values
+            and past_key_values[0] is not None
+            and past_key_values[0][0] is not None
+        ):
+            # past_key_values[0][0] 通常是 key 张量，形状类似 [batch, seq_len, head_dim]
+            start_pos = past_key_values[0][0].shape[1]
+        else:
+            start_pos = 0
 
         # Embedding + dropout
         hidden_states = self.dropout(
