@@ -223,7 +223,7 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
-        # TODO: what is this?隐藏层
+        # 隐藏层
         self.q_proj = nn.Linear(
             args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
         )
@@ -237,7 +237,7 @@ class Attention(nn.Module):
             args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
         )
 
-        # TODO: what is this?flash and dropout
+        # flash and dropout
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -272,6 +272,7 @@ class Attention(nn.Module):
         past_kv = (xk, xv) if use_cache else None
 
         xq = xq.transpose(1, 2)
+        # [bsz, n_local_heads, seq_len, hidden_dim]
         xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
         xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
 
@@ -527,7 +528,7 @@ class MokioMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = (
+        self.ffn = (
             FeedForward(config) if not config.use_moe else MoEFeedForaward(config)
         )
 
@@ -551,7 +552,7 @@ class MokioMindBlock(nn.Module):
 
         hidden_states = res + hidden_states
 
-        hidden_states = hidden_states + self.mlp(
+        hidden_states = hidden_states + self.ffn(
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
@@ -620,6 +621,12 @@ class MokioMindModel(nn.Module):
             self.freqs_sin[start_pos : start_pos + seq_length],
         )
         presents = []
+        # Transformer 的每一层（比如 Layer 1、Layer 2…Layer k），
+        # 都会单独初始化一组 Q、K、V 的线性变换矩阵（即每个层都有自己的W_Q、W_K、W_V）。
+
+        # 这些矩阵是模型在训练时 “逐层学习” 的：
+        # 不同层需要捕捉不同层级的语义信息（比如底层学字面关联，高层学逻辑结构），
+        # 所以需要独立的参数来适配对应层级的计算。
         for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
@@ -631,16 +638,8 @@ class MokioMindModel(nn.Module):
                 attention_mask=attention_mask,
             )
             presents.append(present)
-
         hidden_states = self.norm(hidden_states)
-
-        aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.layers
-            if isinstance(layer.mlp, MoEFeedForaward)
-        )
-
-        return hidden_states, presents, aux_loss
+        return hidden_states, presents
 
 
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -661,7 +660,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **args,
     ):
-        h, past_kvs, aux_loss = self.model(
+        h, past_kvs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
