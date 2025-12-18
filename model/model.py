@@ -31,7 +31,9 @@ class MokioMindConfig(PretrainedConfig):
         hidden_size: int = 512,
         intermediate_size: Optional[int] = None,
         max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
+        num_attention_heads: int = 8,   # 将注意力计算拆分为 8 个独立的 “子注意力头”，
+        # 每个头专注捕捉不同维度的语义关联（比如一个头关注主谓、一个关注动宾），
+        # 最后拼接结果，让模型能更全面地理解上下文依赖。
         num_hidden_layers: int = 8,
         num_key_value_heads: int = 2,
         vocab_size: int = 6400,
